@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import { redisClient } from '../config/redis';
+import { RATE_LIMIT_TIERS, type TierConfig, DEFAULT_TIER } from '../config/tiers';
 import fs from 'fs';
 import path from 'path';
 
@@ -7,29 +8,44 @@ const luaScriptPath = path.resolve(process.cwd(), 'src/scripts/slidingWindow.lua
 const luaScript = fs.readFileSync(luaScriptPath, 'utf-8');
 
 export interface RateLimiterOptions {
-  windowMs: number;
-  maxRequests: number;
+  tierResolver?: (req: Request) => Promise<TierConfig> | TierConfig;
   keyGenerator?: (req: Request) => string;
 }
 
-export function createRateLimiter(options: RateLimiterOptions) {
+export function createDynamicRateLimiter(options: RateLimiterOptions = {}) {
   const {
-    windowMs,
-    maxRequests,
-    keyGenerator = (req: Request) => {
-      const apiKey = req.headers['x-api-key'] || req.headers['X-API-Key'];
-      if (typeof apiKey === 'string' && apiKey.length > 0) return apiKey;
-      return req.ip || req.socket?.remoteAddress || '127.0.0.1';
+    tierResolver = (req: Request): TierConfig => {
+      const apiKey = (req.headers['x-api-key'] || req.headers['X-API-Key']) as string | undefined;
+      if (!apiKey) return DEFAULT_TIER;
+
+      if (apiKey.startsWith('pro_')) return RATE_LIMIT_TIERS.pro ?? DEFAULT_TIER;
+      if (apiKey.startsWith('ent_')) return RATE_LIMIT_TIERS.enterprise ?? DEFAULT_TIER;
+
+      return RATE_LIMIT_TIERS.free ?? DEFAULT_TIER;
+    },
+    keyGenerator = (req: Request): string => {
+      const apiKey = (req.headers['x-api-key'] || req.headers['X-API-Key']) as string | undefined;
+      if (typeof apiKey === 'string' && apiKey.length > 0) return `key:${apiKey}`;
+      return `ip:${req.ip || req.socket?.remoteAddress || '127.0.0.1'}`;
     },
   } = options;
 
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const clientIdentifier = keyGenerator(req);
-    const redisKey = `rate_limit:${clientIdentifier}`;
-    const now = Date.now();
-    const requestId = `${now}_${Math.random().toString(36).substring(2, 9)}`;
+    if (!redisClient.isOpen) {
+      console.warn('⚠️ Redis client is not open. Failing open.');
+      return next();
+    }
 
     try {
+      const clientIdentifier = keyGenerator(req);
+      const redisKey = `rate_limit:${clientIdentifier}`;
+      const now = Date.now();
+      const requestId = `${now}_${Math.random().toString(36).substring(2, 9)}`;
+
+      const tier = (await tierResolver(req)) || DEFAULT_TIER;
+      const { windowMs, maxRequests } = tier;
+
+      // Execute Lua script
       const evalResult = (await redisClient.eval(luaScript, {
         keys: [redisKey],
         arguments: [
@@ -53,7 +69,7 @@ export function createRateLimiter(options: RateLimiterOptions) {
         res.setHeader('Retry-After', retryAfterSeconds);
         res.status(429).json({
           error: 'Too Many Requests',
-          message: `Rate limit exceeded. Try again in ${retryAfterSeconds} seconds.`,
+          message: `Rate limit of ${maxRequests} requests per ${windowMs / 1000}s exceeded.`,
           retryAfter: retryAfterSeconds,
         });
         return;
@@ -61,7 +77,7 @@ export function createRateLimiter(options: RateLimiterOptions) {
 
       next();
     } catch (error) {
-      console.error('⚠️ Rate Limiter Error (Failing Open):', error);
+      console.error('⚠️ Rate Limiter Exception (Failing Open):', error);
       next();
     }
   };
